@@ -1,0 +1,69 @@
+name: Probe empty vector attributes
+on:
+  push:
+    branches: [codex/probe-vgetattr-empty-metadata]
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLIENT_LIBS_TEST_IMAGE_TAG: '8.10.2'
+      CLIENT_LIBS_TEST_STACK_IMAGE_TAG: '8.10.2'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Start isolated Redis
+        run: |
+          pip install invoke -e '.[jwt]'
+          invoke devenv --endpoints standalone
+      - name: Compare stored JSON, VGETATTR and VSIM
+        run: |
+          python - <<'PY'
+          import json, time
+          import redis
+          observer = redis.Redis()
+          for attempt in range(60):
+              try:
+                  observer.ping()
+                  break
+              except redis.ConnectionError:
+                  time.sleep(1)
+          else:
+              raise RuntimeError('Redis did not start')
+          print('client', redis.__version__, 'server', observer.info()['redis_version'])
+          records = []
+          for protocol in (2, 3):
+              for legacy in (True, False):
+                  for decode in (True, False):
+                      client = redis.Redis(protocol=protocol, legacy_responses=legacy, decode_responses=decode)
+                      vset = client.vset()
+                      key = f'empty-attribute-probe-{protocol}-{legacy}-{decode}'
+                      vset.vadd(key, [1, 0], 'doc')
+                      vset.vsetattr(key, 'doc', {})
+                      raw = observer.execute_command('VGETATTR', key, 'doc')
+                      got = vset.vgetattr(key, 'doc')
+                      search = vset.vsim(key, 'doc', with_attribs=True, truth=True, no_thread=True)
+                      element = 'doc' if decode else b'doc'
+                      assert json.loads(raw) == {}
+                      assert got is None
+                      assert search[element] == {}
+                      records.append({'protocol': protocol, 'legacy': legacy, 'decode': decode, 'stored': json.loads(raw), 'vgetattr': got, 'vsim': search[element]})
+                      vset.vsetattr(key, 'doc', '')
+                      assert observer.execute_command('VGETATTR', key, 'doc') is None
+                      assert vset.vgetattr(key, 'doc') is None
+                      assert vset.vsim(key, 'doc', with_attribs=True, truth=True, no_thread=True)[element] is None
+                      client.close()
+          print(json.dumps(records, indent=2))
+          print('Eight configurations reproduce the discrepancy; eight no-attribute controls pass.')
+          with open('probe-results.json', 'w') as fd:
+              json.dump(records, fd, indent=2)
+          observer.close()
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: empty-vector-attributes
+          path: probe-results.json
