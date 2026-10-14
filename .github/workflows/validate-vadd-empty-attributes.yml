@@ -1,0 +1,86 @@
+name: Validate VADD empty attribute updates
+on:
+  push:
+    branches: [codex/validate-vadd-empty-attributes]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  vector-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLIENT_LIBS_TEST_IMAGE_TAG: '8.10.2'
+      CLIENT_LIBS_TEST_STACK_IMAGE_TAG: '8.10.2'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies and start Redis
+        run: |
+          pip install -r dev_requirements.txt
+          pip uninstall -y redis
+          pip install -e '.[jwt]'
+          invoke devenv --endpoints standalone
+          python - <<'PY'
+          import redis, time
+          client = redis.Redis()
+          for attempt in range(60):
+              try:
+                  client.ping()
+                  print(client.info()['redis_version'])
+                  break
+              except redis.ConnectionError:
+                  time.sleep(1)
+          else:
+              raise RuntimeError('Redis did not start')
+          PY
+      - name: Verify regression against unchanged source
+        run: |
+          cp redis/commands/vectorset/commands.py /tmp/patched-vectorset-commands.py
+          git show 1a3eb30bc999dc1b37570e309519f1001853b0ea:redis/commands/vectorset/commands.py > redis/commands/vectorset/commands.py
+          set +e
+          pytest tests/test_vsets.py tests/test_asyncio/test_vsets.py -k test_add_elem_updates_attributes -q --protocol=3 --redis-mod-url=redis://localhost:6379/0 --junit-xml=vector-red.xml
+          result=$?
+          set -e
+          cp /tmp/patched-vectorset-commands.py redis/commands/vectorset/commands.py
+          test "$result" -eq 1
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('vector-red.xml').findall('.//testcase')
+          failures = [case for case in cases if case.find('failure') is not None]
+          assert len(cases) == 15, len(cases)
+          assert len(failures) == 6, len(failures)
+          assert all(case.find('error') is None for case in cases)
+          print('Expected red result: 6 regression failures, 9 passing controls')
+          PY
+      - name: Verify patched vector suite in all protocol and response modes
+        run: |
+          git diff --exit-code
+          for protocol in 2 3; do
+            for legacy in true false; do
+              pytest tests/test_vsets.py tests/test_asyncio/test_vsets.py -q --protocol="$protocol" --legacy-responses="$legacy" --redis-mod-url=redis://localhost:6379/0 --junit-xml="vector-green-${protocol}-${legacy}.xml"
+            done
+          done
+          invoke linters
+          python -m build
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vector-regression-results
+          path: |
+            vector-*.xml
+            dist/*
+  full-default-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/run-tests
+        with:
+          python-version: '3.13'
+          parser-backend: plain
+          redis-version: '8.10.2'
+          test-config: default-legacy_responses
+          run-fixed-clients: 'true'
