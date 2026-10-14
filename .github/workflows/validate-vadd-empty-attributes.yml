@@ -14,8 +14,6 @@ jobs:
       CLIENT_LIBS_TEST_STACK_IMAGE_TAG: '8.10.2'
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 3
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
@@ -40,6 +38,7 @@ jobs:
           PY
       - name: Verify regression against unchanged source
         run: |
+          git fetch --depth=1 origin 1a3eb30bc999dc1b37570e309519f1001853b0ea
           cp redis/commands/vectorset/commands.py /tmp/patched-vectorset-commands.py
           git show 1a3eb30bc999dc1b37570e309519f1001853b0ea:redis/commands/vectorset/commands.py > redis/commands/vectorset/commands.py
           set +e
